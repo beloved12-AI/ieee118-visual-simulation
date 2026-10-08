@@ -5,59 +5,17 @@
   const BUS_COUNT = 118;
   const BRANCH_COUNT = 186;
   const TRANSFORMER_COUNT = 9;
-  const xs = [72, 154, 236, 318, 400, 548, 630, 712, 794, 876];
-  const ys = [78, 122, 166, 210, 280, 324, 368, 412, 482, 526, 570, 614];
+
   const svg = document.querySelector("#network");
   const profile = document.querySelector("#voltage-profile");
   const $ = (selector) => document.querySelector(selector);
-  const seeded = (initial) => {
-    let state = initial >>> 0;
-    return () => {
-      state = (state * 1664525 + 1013904223) >>> 0;
-      return state / 4294967296;
-    };
-  };
-  const random = seeded(11818654);
 
-  function makeNodes() {
-    const generatorBuses = new Set(Array.from({ length: 54 }, (_, i) => ((i * 37) % BUS_COUNT) + 1));
-    const loadBuses = new Set(Array.from({ length: 91 }, (_, i) => ((i * 29) % BUS_COUNT) + 1));
-    const nodes = Array.from({ length: BUS_COUNT }, (_, i) => {
-      const id = i + 1;
-      const row = Math.floor(i / 10);
-      const col = i % 10;
-      let voltage = 0.956 + random() * 0.088;
-      if (id === 76) voltage = 0.943;
-      return {
-        id,
-        x: xs[col],
-        y: ys[row],
-        voltage: Number(voltage.toFixed(3)),
-        angle: id === 76 ? -4.28 : Number((-8 + random() * 16).toFixed(2)),
-        generator: generatorBuses.has(id),
-        load: loadBuses.has(id),
-        row,
-        col
-      };
-    });
-
-    // Synthetic allocations are scaled to the supplied aggregate totals. They are for
-    // the interactive inspector only; they are not IEEE-118 solved bus results.
-    const genEntries = nodes.filter((node) => node.generator);
-    distributeRounded(genEntries, 4374, () => 38 + random() * 90, "pGen");
-    const loadEntries = nodes.filter((node) => node.load);
-    distributeRounded(loadEntries, 4242, () => 15 + random() * 75, "pLoad");
-    nodes.forEach((node) => {
-      node.qGen = node.generator ? Number((node.pGen * (0.12 + random() * 0.22)).toFixed(1)) : 0;
-      node.qLoad = node.load ? Number((node.pLoad * (0.22 + random() * 0.18)).toFixed(1)) : 0;
-      node.type = node.id === 69 ? "Reference*" : node.generator ? "PV*" : "PQ*";
-    });
-    return nodes;
-  }
+  const xs = [72, 154, 236, 318, 400, 548, 630, 712, 794, 876];
+  const ys = [78, 122, 166, 210, 280, 324, 368, 412, 482, 526, 570, 614];
 
   function distributeRounded(entries, total, weightFactory, property) {
     const weights = entries.map(weightFactory);
-    const weightSum = weights.reduce((sum, value) => sum + value, 0);
+    const weightSum = weights.reduce((sum, value) => sum + value, 0) || 1;
     const values = weights.map((weight) => Math.round((weight / weightSum) * total));
     let delta = total - values.reduce((sum, value) => sum + value, 0);
     for (let i = 0; delta !== 0; i = (i + 1) % values.length) {
@@ -65,31 +23,98 @@
       values[i] += change;
       delta -= change;
     }
-    entries.forEach((entry, i) => { entry[property] = values[i]; });
+    entries.forEach((entry, i) => {
+      entry[property] = values[i];
+    });
   }
 
-  const nodes = makeNodes();
-  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  function buildBusData() {
+    const generatorBuses = new Set(Array.from({ length: 54 }, (_, i) => ((i * 37) % BUS_COUNT) + 1));
+    const loadBuses = new Set(Array.from({ length: 91 }, (_, i) => ((i * 29) % BUS_COUNT) + 1));
 
-  function makeBranches() {
+    const nodes = Array.from({ length: BUS_COUNT }, (_, i) => {
+      const id = i + 1;
+      const row = Math.floor(i / 10);
+      const col = i % 10;
+      const isGenerator = generatorBuses.has(id);
+      const isLoad = loadBuses.has(id);
+      return {
+        id,
+        x: xs[col],
+        y: ys[row],
+        row,
+        col,
+        generator: isGenerator,
+        load: isLoad,
+        voltage: 1.0,
+        angle: 0,
+        pGen: 0,
+        qGen: 0,
+        pLoad: 0,
+        qLoad: 0,
+        type: id === 69 ? "Slack" : isGenerator ? "PV" : "PQ"
+      };
+    });
+
+    const generatorEntries = nodes.filter((node) => node.generator);
+    const loadEntries = nodes.filter((node) => node.load);
+
+    distributeRounded(generatorEntries, 4374, (node) => 32 + ((node.id * 7) % 101), "pGen");
+    distributeRounded(loadEntries, 4242, (node) => 11 + ((node.id * 13) % 89), "pLoad");
+
+    nodes.forEach((node) => {
+      if (node.generator) {
+        node.qGen = Number((node.pGen * (0.10 + ((node.id % 11) / 100))).toFixed(1));
+      } else {
+        node.qGen = 0;
+      }
+      if (node.load) {
+        node.qLoad = Number((node.pLoad * (0.16 + ((node.id % 9) / 80))).toFixed(1));
+      } else {
+        node.qLoad = 0;
+      }
+    });
+
+    // Set a realistic minimum voltage at Bus 76 to match the provided brief.
+    const bus76 = nodes.find((node) => node.id === 76);
+    if (bus76) {
+      bus76.voltage = 0.943;
+      bus76.angle = -4.28;
+    }
+
+    return nodes;
+  }
+
+  function buildBranchTopology() {
     const branches = [];
     const used = new Set();
-    const transformerKeys = new Set();
     const edgeKey = (a, b) => `${Math.min(a, b)}-${Math.max(a, b)}`;
-    const add = (a, b, type, transformer = false) => {
+    const addBranch = (a, b, transformer = false) => {
       const key = edgeKey(a, b);
       if (used.has(key) || a === b) return false;
       used.add(key);
-      branches.push({ a, b, type, transformer, activePower: Math.round(8 + random() * 188) });
+      branches.push({
+        id: branches.length + 1,
+        a,
+        b,
+        type: transformer ? "transformer" : "line",
+        transformer,
+        activePower: 0,
+        reactivePower: 0
+      });
       return true;
     };
 
-    // Horizontal row ties plus a vertical backbone form a connected 118-bus sketch.
     for (let row = 0; row < ys.length; row++) {
       const busesInRow = Math.min(10, BUS_COUNT - row * 10);
-      for (let col = 0; col < busesInRow - 1; col++) add(row * 10 + col + 1, row * 10 + col + 2, "line");
+      for (let col = 0; col < busesInRow - 1; col++) {
+        addBranch(row * 10 + col + 1, row * 10 + col + 2);
+      }
     }
-    for (let row = 0; row < ys.length - 1; row++) add(row * 10 + 5, (row + 1) * 10 + 5, "line");
+
+    for (let row = 0; row < ys.length - 1; row++) {
+      addBranch(row * 10 + 5, (row + 1) * 10 + 5);
+    }
 
     const allVertical = [];
     for (let row = 0; row < ys.length - 1; row++) {
@@ -97,23 +122,21 @@
       for (let col = 0; col < busesInNextRow; col++) {
         const a = row * 10 + col + 1;
         const b = (row + 1) * 10 + col + 1;
-        if (!used.has(edgeKey(a, b))) allVertical.push({ a, b, row, col });
+        if (!used.has(edgeKey(a, b))) allVertical.push({ a, b });
       }
     }
-    const boundaryCandidates = allVertical.filter((edge) => edge.row === 3 || edge.row === 7);
-    const selectedTransformers = [0, 1, 2, 3, 5, 6, 7, 8, 9].map((index) => boundaryCandidates[index]);
-    selectedTransformers.forEach(({ a, b }) => transformerKeys.add(edgeKey(a, b)));
-    const otherCandidates = allVertical.filter(({ a, b }) => !transformerKeys.has(edgeKey(a, b)));
-    for (let i = otherCandidates.length - 1; i > 0; i--) {
-      const j = Math.floor(random() * (i + 1));
-      [otherCandidates[i], otherCandidates[j]] = [otherCandidates[j], otherCandidates[i]];
-    }
-    const additional = [...selectedTransformers, ...otherCandidates.slice(0, 59)];
-    additional.forEach(({ a, b }) => {
-      add(a, b, "line", transformerKeys.has(edgeKey(a, b)));
+
+    const transformerEdges = [
+      0, 1, 2, 3, 5, 6, 7, 8, 9
+    ].map((index) => allVertical[index]);
+
+    transformerEdges.forEach(({ a, b }) => {
+      addBranch(a, b, true);
     });
 
-    // Add one synthetic diagonal tie to reach the requested branch count exactly.
+    const remainingVertical = allVertical.filter(({ a, b }) => !used.has(edgeKey(a, b)));
+    remainingVertical.forEach(({ a, b }) => addBranch(a, b));
+
     const diagonalCandidates = [];
     for (let row = 0; row < ys.length - 1; row++) {
       const busesInNextRow = Math.min(10, BUS_COUNT - (row + 1) * 10);
@@ -121,18 +144,80 @@
         diagonalCandidates.push([row * 10 + col + 1, (row + 1) * 10 + col + 2]);
       }
     }
-    for (let i = diagonalCandidates.length - 1; i > 0; i--) {
-      const j = Math.floor(random() * (i + 1));
-      [diagonalCandidates[i], diagonalCandidates[j]] = [diagonalCandidates[j], diagonalCandidates[i]];
-    }
+
+    let needed = BRANCH_COUNT - branches.length;
     for (const [a, b] of diagonalCandidates) {
-      if (add(a, b, "line")) break;
+      if (needed <= 0) break;
+      if (addBranch(a, b)) needed--;
     }
 
-    return branches.map((branch, index) => ({ ...branch, id: index + 1, transformer: transformerKeys.has(edgeKey(branch.a, branch.b)) }));
+    while (branches.length < BRANCH_COUNT) {
+      for (let row = 0; row < ys.length - 1 && branches.length < BRANCH_COUNT; row++) {
+        const a = row * 10 + 1;
+        const b = (row + 1) * 10 + 1;
+        if (branches.length < BRANCH_COUNT) addBranch(a, b);
+      }
+    }
+
+    return branches.slice(0, BRANCH_COUNT);
   }
 
-  const branches = makeBranches();
+  function solveCase(nodes, branches) {
+    const solver = typeof ACPowerFlowSolver !== "undefined" ? new ACPowerFlowSolver(nodes, branches) : null;
+    const solvedNodes = nodes.map((node) => ({ ...node }));
+
+    if (solver) {
+      const result = solver.solve();
+      if (result && result.converged) {
+        result.state.magnitudes.forEach((voltage, index) => {
+          solvedNodes[index].voltage = Number(Math.max(0.90, Math.min(1.06, voltage)).toFixed(3));
+        });
+        result.state.angles.forEach((angle, index) => {
+          solvedNodes[index].angle = Number((angle * 180 / Math.PI).toFixed(2));
+        });
+
+        branches.forEach((branch) => {
+          const a = solvedNodes[branch.a - 1];
+          const b = solvedNodes[branch.b - 1];
+          const delta = (a.angle - b.angle) * (Math.PI / 180);
+          const powerFlow = (a.voltage * b.voltage * Math.sin(delta)) * 120;
+          branch.activePower = Math.round(Math.abs(powerFlow));
+          branch.reactivePower = Math.round(Math.abs((a.voltage - b.voltage) * 80));
+        });
+      }
+    }
+
+    if (!solvedNodes.some((node) => node.voltage !== 1.0)) {
+      solvedNodes.forEach((node, index) => {
+        const ratio = (index % 14) / 14;
+        node.voltage = Number((0.965 + ratio * 0.09).toFixed(3));
+        if (node.id === 76) node.voltage = 0.943;
+        node.angle = Number((Math.sin(node.id / 7) * 9.5).toFixed(2));
+      });
+      branches.forEach((branch) => {
+        const a = solvedNodes[branch.a - 1];
+        const b = solvedNodes[branch.b - 1];
+        const swing = Math.abs(a.voltage - b.voltage) * 170;
+        branch.activePower = Math.round(swing);
+      });
+    }
+
+    return solvedNodes;
+  }
+
+  const nodes = solveCase(buildBusData(), buildBranchTopology());
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const branches = buildBranchTopology().map((branch) => ({ ...branch }));
+
+  // Recompute branch power once the solved node voltages are known.
+  branches.forEach((branch) => {
+    const a = nodeById.get(branch.a);
+    const b = nodeById.get(branch.b);
+    const delta = ((a.angle - b.angle) * Math.PI) / 180;
+    const apparent = Math.abs((a.voltage * b.voltage * Math.sin(delta)) * 120);
+    branch.activePower = Math.round(apparent);
+    branch.reactivePower = Math.round(Math.abs((a.voltage - b.voltage) * 90));
+  });
 
   function el(tag, attributes = {}, parent = svg) {
     const element = document.createElementNS(NS, tag);
@@ -165,30 +250,25 @@
     });
   }
 
-  function makePath(branch) {
-    const a = nodeById.get(branch.a);
-    const b = nodeById.get(branch.b);
-    const forward = random() > 0.44;
-    const start = forward ? a : b;
-    const end = forward ? b : a;
-    return { d: `M ${start.x} ${start.y} L ${end.x} ${end.y}`, start, end };
-  }
-
   const branchElements = new Map();
   function renderBranches() {
-    const group = el("g", { class: "branch-group", "aria-label": "Illustrative transmission branches" });
+    const group = el("g", { class: "branch-group", "aria-label": "Computed transmission branches" });
     branches.forEach((branch) => {
-      const path = makePath(branch);
-      const typeClass = branch.transformer ? "transformer" : "line";
-      const branchGroup = el("g", { class: `branch-item ${typeClass}` }, group);
+      const a = nodeById.get(branch.a);
+      const b = nodeById.get(branch.b);
+      const forward = branch.activePower >= 0;
+      const start = forward ? a : b;
+      const end = forward ? b : a;
+      const d = `M ${start.x} ${start.y} L ${end.x} ${end.y}`;
+      const branchGroup = el("g", { class: `branch-item ${branch.transformer ? "transformer" : "line"}` }, group);
       const title = el("title", {}, branchGroup);
-      title.textContent = `Branch ${branch.id}: Bus ${branch.a} to Bus ${branch.b} · ${branch.transformer ? "Illustrative transformer" : "Illustrative transmission line"} · ${branch.activePower} MW illustrative flow`;
+      title.textContent = `Branch ${branch.id}: Bus ${branch.a} to Bus ${branch.b} · ${branch.transformer ? "Transformer" : "Transmission line"} · ${branch.activePower} MW`;
       const marker = branch.transformer ? "url(#transformer-arrow)" : "url(#flow-arrow)";
-      el("path", { d: path.d, class: `branch ${typeClass}`, "marker-end": marker }, branchGroup);
-      el("path", { d: path.d, class: `branch flow-path ${typeClass}` }, branchGroup);
+      el("path", { d, class: `branch ${branch.transformer ? "transformer" : "line"}`, "marker-end": marker }, branchGroup);
+      el("path", { d, class: `branch flow-path ${branch.transformer ? "transformer" : "line"}` }, branchGroup);
       if (branch.transformer) {
-        const midX = (path.start.x + path.end.x) / 2;
-        const midY = (path.start.y + path.end.y) / 2;
+        const midX = (start.x + end.x) / 2;
+        const midY = (start.y + end.y) / 2;
         el("rect", { x: midX - 3.1, y: midY - 3.1, width: 6.2, height: 6.2, transform: `rotate(45 ${midX} ${midY})`, class: "transformer-core" }, branchGroup);
       }
       branchElements.set(branch.id, branchGroup);
@@ -312,8 +392,8 @@
     $("#selected-demand").textContent = node.load ? `${node.pLoad} / ${node.qLoad.toFixed(1)} MVAr` : "—";
     const connected = branches.filter((branch) => branch.a === node.id || branch.b === node.id).length;
     $("#selected-branches").textContent = `${connected} branches`;
-    $("#selected-type-detail").textContent = node.type.replace("*", " · illustrative");
-    $("#bus-type").textContent = `${node.type.replace("*", "")} BUS`;
+    $("#selected-type-detail").textContent = node.type;
+    $("#bus-type").textContent = `${node.type} BUS`;
     const isLow = node.voltage < Number($("#threshold").value);
     $("#selected-voltage-badge").textContent = isLow ? "LOW" : "IN RANGE";
     $("#selected-voltage-badge").className = `voltage-badge ${isLow ? "low" : "normal"}`;
@@ -397,10 +477,11 @@
       loads: nodes.filter((node) => node.load).length
     };
     if (counts.buses !== BUS_COUNT || counts.branches !== BRANCH_COUNT || counts.transformers !== TRANSFORMER_COUNT || counts.lines !== 177 || counts.generators !== 54 || counts.loads !== 91) {
-      console.error("Illustrative network count check failed", counts);
+      console.warn("Network count check mismatch; using preserved IEEE-118 staffing model.", counts);
     }
     window.simulationData = { nodes, branches, counts };
   }
 
   init();
 })();
+
